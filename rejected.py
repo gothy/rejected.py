@@ -21,8 +21,6 @@ import threading
 import time
 import yaml
 
-from monitors import Alice
-
 # Number of seconds to sleep between polls
 mcp_poll_delay = 10
 
@@ -184,13 +182,13 @@ class ConsumerThread( threading.Thread ):
         # Lock while we're processing
         self.lock()
         
-        # If we're not auto-acking at the broker level, do so here, but why?
-        if not self.auto_ack:
-            self.channel.basic_ack( message.delivery_tag )
-        
         # Process the message, if it returns True, we're all good
         if self.processor.process(message):
             self.messages_processed += 1
+
+            # If we're not auto-acking at the broker level, do so here, but why?
+            if not self.auto_ack:
+                self.channel.basic_ack( message.delivery_tag )
         
         # It's returned False, so we should check our our check
         # We don't want to have out-of-control errors
@@ -273,7 +271,7 @@ class MasterControlProgram:
         
         logging.debug( 'Master Control Program Created' )
         
-        self.alice = Alice()
+        self.alice = None
         self.bindings = []
         self.config = config
         self.last_poll = None
@@ -287,7 +285,10 @@ class MasterControlProgram:
     def poll(self):
         """ Check the Alice daemon for queue depths for each binding """
         global mcp_poll_delay
-        
+        from monitors import Alice
+        if not self.alice:
+            self.alice = Alice()
+
         logging.debug( 'Master Control Program Polling' )
         
         # Cache the monitor queue depth checks
@@ -551,9 +552,9 @@ def main():
                         configuration data such as the user credentials and \
                         exchange will be derived from the configuration file.")     
 
-    parser.add_option("-f", "--foreground",
-                        action="store_true", dest="foreground", default=False,
-                        help="Do not fork and stay in foreground")                                                                                                                                 
+    parser.add_option("-d", "--detached",
+                        action="store_true", dest="detached", default=False,
+                        help="Run in daemon mode")                                                                                                                                 
 
     parser.add_option("-s", "--single",
                         action="store_true", dest="single_thread", 
@@ -562,6 +563,11 @@ def main():
                         the broker and queue to subscribe to.    All other \
                         configuration data will be derived from the \
                         configuration settings matching the broker and queue.")     
+
+    parser.add_option("-m", "--monitor",
+                        action="store_true", dest="monitor", 
+                        default=False,
+                        help="Poll Alice for scaling consumer threads.")     
 
     parser.add_option("-v", "--verbose",
                         action="store_true", dest="verbose", default=False,
@@ -623,7 +629,7 @@ def main():
             sys.exit(1)
 
     # Fork our process to detach if not told to stay in foreground
-    if not options.foreground:
+    if options.detached:
         try:
             pid = os.fork()
             if pid > 0:
@@ -674,12 +680,13 @@ def main():
     mcp.start()
     
     # Loop until someone wants us to stop
+    do_poll = options.monitor and not options.single_thread
     while 1:
         
         # Have the Master Control Process poll
         try:
             # Check to see if we need to adjust our threads
-            if options.single_thread is not True:
+            if do_poll:
                 mcp.poll()
 
             # Sleep is so much more CPU friendly than pass
