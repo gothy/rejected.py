@@ -635,11 +635,6 @@ def main():
                         configuration data will be derived from the \
                         configuration settings matching the broker and queue.")     
 
-    parser.add_option("-m", "--monitor",
-                        action="store_true", dest="monitor", 
-                        default=False,
-                        help="Poll Alice for scaling consumer threads.")     
-
     parser.add_option("-v", "--verbose",
                         action="store_true", dest="verbose", default=False,
                         help="use debug to stdout instead of logging settings")
