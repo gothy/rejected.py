@@ -91,8 +91,8 @@ class ConsumerThread( threading.Thread ):
             return connection
 
         # amqp lib is only raising a generic exception which is odd since it has a AMQPConnectionException class
-        except Exception as (errno, strerror):
-            logging.error( 'Connection error #%i: %s' % (errno, strerror) )
+        except IOError, e:
+            logging.error( 'Connection error #%i: %s' % (e.errno, e.message) )
             raise ConnectionException
 
     def get_information(self):
@@ -281,12 +281,21 @@ class ConsumerThread( threading.Thread ):
          - remove channel closing timeout since it can cause a protocol
           violation
         Ideally we'd add this back at some point
+        
+        This hangs because channel.wait in the thread is blocking on socket.recv.
+        channel.close sends the close message, then enters ultimately into
+        socket.recv to get the close_ok response.  Depending on the timing,
+        the channel.wait has picked up the close_ok after channel.close (on main
+        thread) entered socket.recv.
+        
+        I was looking at a nonblocking method to deal with this properly:
+        http://www.lshift.net/blog/2009/02/18/evserver-part2-rabbit-and-comet
         """
         #self.channel.close()
         if self.connection:
             try:
                 self.connection.close()
-            except IOError:
+            except IOError, e:
                 # We're already closed
                 pass
 
@@ -351,7 +360,7 @@ class MasterControlProgram:
             for thread_name, thread in binding['threads'].items():
             
                 # Make sure the thread is still alive, otherwise remove it and move on
-                if not thread.is_alive():
+                if not thread.isAlive():
                     logging.error( 'Encountered a dead thread: %s, removing it from the stack' % thread_name )
                     del binding['threads'][thread_name]
                     continue
@@ -561,7 +570,7 @@ class MasterControlProgram:
                     thread.start()
 
                     # Check to see if the thread is alive before adding it to our stack
-                    if thread.is_alive():
+                    if thread.isAlive():
 
                         # Add to our dictionary of active threads
                         binding['threads'][thread_name] = thread
