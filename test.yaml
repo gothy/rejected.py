@@ -35,11 +35,14 @@ Queues:
         exclusive: False
 
 Bindings:
-    Email.Hotmail:
+    # binding names are meaningless, only used as a key to the configuration
+    # and for logging, they must be unique
+    hotmail:
         import: processors.test_processor
         processor: test_processor 
         connections: [mq07]
         exchange: Email
+        routing_key: Email.Hotmail
         queue: Hotmail
         consumers:
             # Auto-Ack Messages?

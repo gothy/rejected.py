@@ -48,6 +48,7 @@ class ConsumerThread( threading.Thread ):
         # Initialize object wide variables
         self.auto_ack = binding['consumers']['auto_ack']
         self.binding_name = binding_name
+        self.routing_key = binding['routing_key']
         self.connect_name = connect_name
         self.connection = None
         self.errors = 0
@@ -105,6 +106,7 @@ class ConsumerThread( threading.Thread ):
         return { 
                  'connection': self.connect_name, 
                  'binding': self.binding_name,
+                 'routing_key': self.routing_key,
                  'queue': self.queue_name,
                  'processed': self.messages_processed,
                  'throttle_count': self.throttle_count
@@ -150,7 +152,7 @@ class ConsumerThread( threading.Thread ):
                msg.properties['delivery_mode'] = 2
                self.channel.basic_publish( msg,
                                            exchange = self.exchange,
-                                           routing_key = self.binding_name )
+                                           routing_key = self.routing_key )
            
            # Keep track of how many errors we've had
            self.errors += 1
@@ -206,7 +208,21 @@ class ConsumerThread( threading.Thread ):
         # Import our processor class
         import_name = self.config['Bindings'][self.binding_name]['import']
         class_name = self.config['Bindings'][self.binding_name]['processor']
-        class_module = getattr(__import__(import_name), class_name)
+        
+        # Try and import the module
+        try:
+            class_module = getattr(__import__(import_name), class_name)
+        
+        except ImportError:
+            logging.error( 'Could not import the "%s" module.' % import_name )
+            self.running = False
+            return
+
+        except AttributeError:
+            logging.error( 'Did not find the class "%s" in the module "%s".' % ( class_name, import_name ) )
+            self.running = False
+            return
+                
         processor_class = getattr(class_module, class_name)
         logging.info( 'Creating message processor: %s.%s in %s' % 
                       ( import_name, class_name, self.thread_name ) )
@@ -247,7 +263,7 @@ class ConsumerThread( threading.Thread ):
         # Bind to the Queue / Exchange
         self.channel.queue_bind( queue = self.queue_name, 
                                  exchange = self.exchange,
-                                 routing_key = self.binding_name )
+                                 routing_key = self.routing_key )
 
         # Wait for messages
         logging.debug( 'Waiting on messages for "%s"' %  self.thread_name )
@@ -445,9 +461,10 @@ class MasterControlProgram:
                     # If our queue depth exceeds the threshold and we haven't maxed out make a new worker
                     if queue_depth > threshold and len(binding['threads']) < max:
                 
-                        logging.info( 'Spawning worker thread for connection "%s" binding "%s": %i messages pending, %i threshhold, %i min, %i max, %i consumers active.' % 
+                        logging.info( 'Spawning worker thread for connection "%s" binding "%s" routing_key "%s": %i messages pending, %i threshhold, %i min, %i max, %i consumers active.' % 
                                         ( info['connection'], 
                                           info['binding'], 
+                                          info['routing_key'], 
                                           queue_depth, 
                                           threshold,
                                           min,
@@ -455,8 +472,9 @@ class MasterControlProgram:
                                           len(binding['threads']) ) )
 
                         # Create a unique thread name
-                        new_thread_name = '%s_%s_%i' % ( info['connection'], 
+                        new_thread_name = '%s_%s_%s_%i' % ( info['connection'], 
                                                      info['binding'], 
+                                                     info['routing_key'], 
                                                      len(binding['threads']))
 
                         # Create the new thread making it use self.consume
@@ -480,9 +498,10 @@ class MasterControlProgram:
                     # Remove a thread
                     for thread_name, thread in binding['threads'].items():
                         if not thread.is_locked():
-                            logging.info( 'Removed worker thread for connection "%s" binding "%s": %i messages pending, %i threshhold, %i min, %i max, %i consumers active.' % 
+                            logging.info( 'Removed worker thread for connection "%s" binding "%s" routing_key "%s": %i messages pending, %i threshhold, %i min, %i max, %i consumers active.' % 
                                             ( info['connection'], 
                                               info['binding'], 
+                                              info['routing_key'], 
                                               queue_depth, 
                                               threshold,
                                               min,
@@ -561,9 +580,9 @@ class MasterControlProgram:
             for connect_name in self.config['Bindings'][binding_name]['connections']:
                 for i in xrange( 0, self.config['Bindings'][binding_name]['consumers']['min'] ):
                     logging.debug( 'Creating worker thread #%i for connection "%s" binding "%s"' % ( i, connect_name, binding_name ) )
-
+                    routing_key = self.config['Bindings'][binding_name]['routing_key']
                     # Create a unique thread name
-                    thread_name = '%s_%s_%i' % ( connect_name, binding_name, i )
+                    thread_name = '%s_%s_%s_%i' % ( connect_name, binding_name, routing_key, i )
 
                     # Create the new thread making it use self.consume
                     thread = ConsumerThread( self.config,
