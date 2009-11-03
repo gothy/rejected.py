@@ -83,16 +83,20 @@ class ConsumerThread( threading.Thread ):
 
         try:
             # Try and create our new AMQP connection
-            connection = amqp.Connection( host ='%s:%s' % ( configuration['host'], configuration['port'] ),
+            try:
+                connection = amqp.Connection( host ='%s:%s' % ( configuration['host'], configuration['port'] ),
                                 userid = configuration['user'], 
                                 password = configuration['pass'], 
                                 ssl = configuration['ssl'],
                                 virtual_host = configuration['vhost'] )
+            except Exception, e:
+                logging.error("Unable to connect to host %s:%s" % ( configuration['host'], configuration['port']))
+                raise e
             return connection
 
         # amqp lib is only raising a generic exception which is odd since it has a AMQPConnectionException class
         except IOError, e:
-            logging.error( 'Connection error #%i: %s' % (e.errno, e.message) )
+            logging.error( 'Connection error #%s: %s' % (e.errno, e.message) )
             raise ConnectionException
 
     def get_information(self):
@@ -153,7 +157,8 @@ class ConsumerThread( threading.Thread ):
            
            # If we've had too many according to the configuration, shutdown
            if self.errors >= self.max_errors:
-               logging.error( 'Received %i errors, shutting down thread "%s"' % self.thread_name )
+               logging.error( 'Received %i errors, shutting down thread "%s"'
+                    % (self.errors, self.thread_name) )
                self.shutdown()
                return
            
@@ -205,7 +210,7 @@ class ConsumerThread( threading.Thread ):
         processor_class = getattr(class_module, class_name)
         logging.info( 'Creating message processor: %s.%s in %s' % 
                       ( import_name, class_name, self.thread_name ) )
-        self.processor = processor_class()
+        self.processor = processor_class(self)
             
         # Connect to the AMQP Broker
         try:
@@ -688,7 +693,7 @@ def main():
     else:
         # Build a specific path to our log file
         if config['Logging'].has_key('filename'):
-            config['Logging']['filename'] = "%s/%s/%s" % ( 
+            config['Logging']['filename'] = os.path.join(
                 config['Location']['base'], 
                 config['Location']['logs'], 
                 config['Logging']['filename'] )
@@ -743,13 +748,11 @@ def main():
         sys.stdin.close()
         
         # Redirect stdout, stderr
-        sys.stdout = open('%s/%s/stdout.log' % ( config['Location']['base'], 
-                                                 config['Location']['logs']), 
-                                                 'w')
-        sys.stderr = open('%s/%s/stderr.log' % ( config['Location']['base'], 
-                                                 config['Location']['logs']), 
-                                                 'w')
-                                                 
+        sys.stdout = open(os.path.join(config['Location']['base'], 
+            config['Location']['logs'], "stdout.log"), 'w')
+        sys.stderr = open(os.path.join(config['Location']['base'], 
+            config['Location']['logs'], "stderr.log"), 'w')
+
     # Set our signal handler so we can gracefully shutdown
     signal.signal(signal.SIGTERM, shutdown)
 

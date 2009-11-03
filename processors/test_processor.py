@@ -2,6 +2,8 @@
 import logging
 
 class test_processor:
+    def __init__(self, consumer):
+        self.consumer = consumer
     
     def process(self, message):
         
