@@ -4,12 +4,21 @@ Rejected AMQP Consumer Framework
 
 A multi-threaded consumer application and how!
 
-Created by Gavin M. Roy on 2009-09-10.
-@author Gavin M. Roy
-@copyright 2009 Insider Guides, Inc.. All rights reserved.
-@license BSD License
-@since 2009-09-10
+Copyright (c) 2009,  Insider Guides, Inc.
+All rights reserved.
+ 
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+ 
+Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+Neither the name of the Insider Guides, Inc. nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
+
+__author__  = "Gavin M. Roy"
+__email__   = "gmr@myyearbook.com"
+__date__    = "2009-09-10"
+__version__ = 0.2
 
 import amqplib.client_0_8 as amqp
 import exceptions
@@ -21,23 +30,26 @@ import signal
 import threading
 import time
 import yaml
+import zlib
+import socket
 
 # Number of seconds to sleep between polls
 mcp_poll_delay = 10
 
-version = '0.1'
+# Process name will be overriden by the config file
+process = 'Unknown'
+
 class ConnectionException( exceptions.Exception ):
     
     def __str__(self):
         return "Connection Failed"
 
-    
 class ConsumerThread( threading.Thread ):
     """ Consumer Class, Handles the actual AMQP work """
     
-    def __init__( self, configuration, thread_name, binding_name, connect_name ):
+    def __init__( self, configuration, binding_name, connect_name ):
 
-        logging.debug( 'Initializing a Consumer class in thread "%s"' % thread_name )
+        logging.debug( 'Initializing a Consumer Thread' )
 
         # Rejected full Configuration
         self.config = configuration
@@ -49,18 +61,22 @@ class ConsumerThread( threading.Thread ):
         self.auto_ack = binding['consumers']['auto_ack']
         self.binding_name = binding_name
         self.routing_key = binding['routing_key']
+        if binding.has_key('compressed'):
+            self.compressed = binding['compressed']
+        else:
+            self.compressed = False
         self.connect_name = connect_name
         self.connection = None
         self.errors = 0
         self.interval_count = 0
         self.interval_start = None
         self.locked = False
+        self.monitor_port = None
         self.max_errors = binding['consumers']['max_errors']
         self.messages_processed = 0
         self.requeue_on_error = binding['consumers']['requeue_on_error']
         self.running = True
         self.queue_name = None
-        self.thread_name = thread_name
         
         # If we have throttle config use it
         self.throttle = False
@@ -80,7 +96,7 @@ class ConsumerThread( threading.Thread ):
         """ Connect to an AMQP Broker  """
 
         logging.debug( 'Creating a new connection for "%s" in thread "%s"' % 
-                        ( self.binding_name, self.thread_name ) )
+                        ( self.binding_name, self.getName() ) )
 
         try:
             # Try and create our new AMQP connection
@@ -97,7 +113,7 @@ class ConsumerThread( threading.Thread ):
 
         # amqp lib is only raising a generic exception which is odd since it has a AMQPConnectionException class
         except IOError, e:
-            logging.error( 'Connection error #%s: %s' % (e.errno, e.message) )
+            logging.error( 'Connection error %s' % (e) )
             raise ConnectionException
 
     def get_information(self):
@@ -108,6 +124,7 @@ class ConsumerThread( threading.Thread ):
                  'binding': self.binding_name,
                  'routing_key': self.routing_key,
                  'queue': self.queue_name,
+                 'monitor_port': self.monitor_port,
                  'processed': self.messages_processed,
                  'throttle_count': self.throttle_count
                }
@@ -123,57 +140,84 @@ class ConsumerThread( threading.Thread ):
         self.locked = True
 
     def process(self, message):
-       """ Process a message from Rabbit"""
-       
-       # If we're throttling
-       if self.throttle and self.interval_start is None:
+        """ Process a message from Rabbit"""
+        
+        # If we're throttling
+        if self.throttle and self.interval_start is None:
            self.interval_start = time.time()
-   
-       # Lock while we're processing
-       self.lock()
-       
-       # Process the message, if it returns True, we're all good
-       if self.processor.process(message):
-           self.messages_processed += 1
-
-           # If we're not auto-acking at the broker level, do so here, but why?
-           if not self.auto_ack:
-               self.channel.basic_ack( message.delivery_tag )
-
-       # It's returned False, so we should check our our check
-       # We don't want to have out-of-control errors
-       else:
-           # Unlock
-           self.unlock()
-           
-           # Do we need to requeue?  If so, lets send it
-           if self.requeue_on_error:
+        
+        # Lock while we're processing
+        self.lock()
+        
+        # If we're compressed in message body, decompress it
+        if self.compressed:
+            try:
+            	message.body = zlib.decompress(message.body)
+            except:
+                logging.warning('Invalid zlib compressed message.body')
+        
+        # Process the message, if it returns True, we're all good
+        try:
+            if self.processor.process(message):
+                self.messages_processed += 1
+        
+                # If we're not auto-acking at the broker level, do so here, but why?
+                if not self.auto_ack:
+                    self.channel.basic_ack( message.delivery_tag )
+        
+            # It's returned False, so we should check our our check
+            # We don't want to have out-of-control errors
+            else:
+            
+               # Unlock
+               self.unlock()
+               
+               # Do we need to requeue?  If so, lets send it
+               if self.requeue_on_error:
+                   msg = amqp.Message(message.body)
+                   msg.properties['delivery_mode'] = 2
+                   self.channel.basic_publish( msg,
+                                               exchange = self.exchange,
+                                               routing_key = self.routing_key )
+               
+               # Keep track of how many errors we've had
+               self.errors += 1
+               
+        except Exception as e:
+            logging.critical('ConsumerThread: Processor threw an uncaught exception')
+            logging.critical('ConsumerThread: %s' % str(e))
+             
+            # Unlock
+            self.unlock()
+            
+            # Do we need to requeue?  If so, lets send it
+            if self.requeue_on_error:
                msg = amqp.Message(message.body)
                msg.properties['delivery_mode'] = 2
                self.channel.basic_publish( msg,
                                            exchange = self.exchange,
                                            routing_key = self.routing_key )
            
-           # Keep track of how many errors we've had
-           self.errors += 1
+            # Keep track of how many errors we've had
+            self.errors += 1
+        
+            # If we've had too many according to the configuration, shutdown
+            if self.errors >= self.max_errors:
+                logging.error( 'Received %i errors, shutting down thread "%s"' % ( self.errors, self.getName() ) )
+                self.shutdown()
+                return
+        
            
-           # If we've had too many according to the configuration, shutdown
-           if self.errors >= self.max_errors:
-               logging.error( 'Received %i errors, shutting down thread "%s"'
-                    % (self.errors, self.thread_name) )
-               self.shutdown()
-               return
-           
-       # Unlock the thread, safe to shutdown
-       self.unlock()
-   
-       # If we're throttling
-       if self.throttle:
-       
+        # Unlock the thread, safe to shutdown
+        self.unlock()
+        
+        # If we're throttling
+        if self.throttle:
+        
            # Get the duration from when we starting this interval to now
            self.throttle_duration += time.time() - self.interval_start
            self.interval_count += 1
-
+        
            # If the duration is less than 1 second and we've processed up to (or over) our max
            if self.throttle_duration <= 1 and self.interval_count >= self.throttle_threshold:
            
@@ -183,12 +227,12 @@ class ConsumerThread( threading.Thread ):
                # Figure out how much time to sleep
                sleep_time = 1 - self.throttle_duration
                
-               logging.debug( 'Throttling to %i message(s) per second on %s, waiting %f seconds.' % 
-                              ( self.throttle_threshold, self.thread_name, sleep_time ) )
+               logging.debug( '%s: Throttling to %i message(s) per second, waiting %.2f seconds.' % 
+                              ( self.getName(), self.throttle_threshold, sleep_time ) )
                
                # Sleep and setup for the next interval
                time.sleep(sleep_time)
-
+        
                # Reset our counters
                self.interval_count = 0
                self.interval_start = None
@@ -203,37 +247,48 @@ class ConsumerThread( threading.Thread ):
     def run( self ):
         """ Meat of the queue consumer code """
 
-        logging.debug( 'In consumer run for thread "%s"' % self.thread_name )
+        logging.debug( '%s: Running thread' % self.getName() )
+        retries = 100
+        while self.running:
+            try:
+                self.connectAndWait()
+            except Exception, e:
+                logging.info( '%s: connectAndWait %r' % (self.getName(), e) )
+                retries -= 1
+                if retries < 1:
+                    break
+                time.sleep(1)
+        logging.info( '%s: Exiting ConsumerThread.run()' % self.getName() )
 
+    def connectAndWait(self):
         # Import our processor class
         import_name = self.config['Bindings'][self.binding_name]['import']
         class_name = self.config['Bindings'][self.binding_name]['processor']
         
         # Try and import the module
         try:
-            class_module = getattr(__import__(import_name), class_name)
-        
+            processor_module = __import__(import_name)
         except ImportError:
-            logging.error( 'Could not import the "%s" module.' % import_name )
+            logging.error( '%s: Could not import the "%s" module.' % ( self.getName(), import_name ) )
             self.running = False
             return
 
-        except AttributeError:
-            logging.error( 'Did not find the class "%s" in the module "%s".' % ( class_name, import_name ) )
-            self.running = False
-            return
-                
-        processor_class = getattr(class_module, class_name)
-        logging.info( 'Creating message processor: %s.%s in %s' % 
-                      ( import_name, class_name, self.thread_name ) )
-        self.processor = processor_class(self)
+        file_parts = import_name.split('.')
+        processor_class = getattr(processor_module.__dict__[file_parts[len(file_parts)-1]], class_name)
+        logging.info( '%s: Creating message processor: %s.%s' % 
+                      ( self.getName(), import_name, class_name ) )
+                      
+        # If we have a config, pass it in to the constructor                      
+        if self.config['Bindings'][self.binding_name].has_key('config'):
+            self.processor = processor_class(self, self.config['Bindings'][self.binding_name]['config'])
+        else:
+            self.processor = processor_class(self)
             
+        # Assign the port to monitor the queues on
+        self.monitor_port = self.config['Connections'][self.connect_name]['monitor_port']
+
         # Connect to the AMQP Broker
-        try:
-            self.connection = self.connect( self.config['Connections'][self.connect_name] )
-        except ConnectionException:
-            self.running = False
-            return
+        self.connection = self.connect( self.config['Connections'][self.connect_name] )
         
         # Create the Channel
         self.channel = self.connection.channel()
@@ -266,34 +321,31 @@ class ConsumerThread( threading.Thread ):
                                  routing_key = self.routing_key )
 
         # Wait for messages
-        logging.debug( 'Waiting on messages for "%s"' %  self.thread_name )
+        logging.debug( '%s: Waiting on messages' %  self.getName() )
 
         # Let AMQP know to send us messages
         self.channel.basic_consume( queue = self.queue_name, 
                                     no_ack = self.auto_ack,
                                     callback = self.process, 
-                                    consumer_tag = self.thread_name )
+                                    consumer_tag = self.getName() )
 
         # Initialize our throttle variable if we need it
         interval_start = None
         
         # Loop as long as the thread is running
         while self.running:
-            
             # Wait on messages
-            try:
-                self.channel.wait()
-            except AttributeError, IOError:
-                break
+            self.channel.wait()
                 
-        logging.debug( 'Exiting ConsumerThread.run() for %s' % self.thread_name )
+        logging.info( '%s: Exiting ConsumerThread.connectAndWait()' % self.getName() )
                     
     def shutdown(self):
         """ Gracefully close the connection """
 
         if self.running:
-            logging.debug( 'Shutting down consumer "%s"' % self.thread_name )
+            logging.debug( 'Shutting down consumer thread "%s"' % self.getName() )
             self.running = False
+            return False
         
         """ 
         This is hanging for me at times, non-predictably, I wonder if this has to
@@ -315,11 +367,21 @@ class ConsumerThread( threading.Thread ):
         #self.channel.close()
         if self.connection:
             try:
+                logging.debug('%s: Closing the AMQP connection' % self.getName())
                 self.connection.close()
+                logging.debug('%s: AMQP connection closed' % self.getName())
             except IOError, e:
                 # We're already closed
-                pass
+                logging.debug('%s: Error closing the AMQP connection.' % self.getName())
 
+        logging.debug('%s: Shutting down processor' % self.getName())
+        try:
+            self.processor.shutdown()
+        except AttributeError:
+            logging.debug('%s: Processor does not have a shutdown method' % self.getName())
+
+        return True
+            
     def unlock( self ):
         """ Unlock the thread so MCP can shut us down """
         
@@ -330,11 +392,11 @@ class MasterControlProgram:
 
     def __init__(self, config, options):
         
-        logging.debug( 'Master Control Program Created' )
+        logging.debug( 'MCP: Master Control Program Created' )
         
         # If we have monitoring enabled for elasic resizing
         if config['Monitor']['enabled']:
-            from monitors import Alice
+            from rejected.monitors import Alice
             self.alice = Alice()
         else:
             self.alice = None
@@ -354,7 +416,7 @@ class MasterControlProgram:
         """ Check the Alice daemon for queue depths for each binding """
         global mcp_poll_delay
         
-        logging.debug( 'Master Control Program Polling' )
+        logging.debug( 'MCP: Master Control Program Polling' )
         
         # Cache the monitor queue depth checks
         cache_lookup = {}
@@ -378,18 +440,22 @@ class MasterControlProgram:
         for binding in self.bindings:
         
             # Go through the threads to check the queue depths for each server
-            for thread_name, thread in binding['threads'].items():
+            dead_threads = []
+            for x in xrange(0, len(binding['threads'])):
             
                 # Make sure the thread is still alive, otherwise remove it and move on
-                if not thread.isAlive():
-                    logging.error( 'Encountered a dead thread: %s, removing it from the stack' % thread_name )
-                    del binding['threads'][thread_name]
-                    continue
-
+                if not binding['threads'][x].isAlive():
+                    logging.error( 'MCP: Encountered a dead thread, removing.' )
+                    dead_threads.append(x)
+            
+            # Remove dead threads
+            for list_offset in dead_threads:
+                logging.error( 'MCP: Removing the dead thread from the stack' )
+                binding['threads'].pop(list_offset)
 
             # If we don't have any consumer threads, remove the binding
             if not len(binding['threads']):
-                logging.error( 'We have no working consumers, removing down this binding.' )
+                logging.error( 'MCP: We have no working consumers, removing down this binding.' )
                 del self.bindings[offset]
                 
             # Increment our list offset
@@ -397,7 +463,7 @@ class MasterControlProgram:
         
         # If we have removed all of our bindings because they had no working threads, shutdown         
         if not len(self.bindings):
-            logging.error( 'We have no working bindings, shutting down.' )
+            logging.error( 'MCP: We have no working bindings, shutting down.' )
             shutdown()
             return
             
@@ -409,11 +475,14 @@ class MasterControlProgram:
             for binding in self.bindings:
             
                 # Go through the threads to check the queue depths for each server
-                for thread_name, thread in binding['threads'].items():
+                for thread in binding['threads']:
                 
                     # Get our thread data such as the connection and queue it's using
                     info = thread.get_information()
-      
+                
+                    # Stats are keyed on thread name
+                    thread_name = thread.getName()
+
                     # Check our stats info
                     if thread_name in self.thread_stats:
         
@@ -425,12 +494,12 @@ class MasterControlProgram:
                         total_processed += processed
                         total_throttled += throttled
             
-                        logging.debug( '%s processed %i messages in %f seconds (%f mps) - Throttled %i times' % 
+                        logging.debug( '%s processed %i messages and throttled %i messages in %.2f seconds at a rate of %.2f mps.' % 
                             ( thread_name, 
                               processed,  
+                              throttled,
                               duration_since_last_poll, 
-                              ( float(processed) / duration_since_last_poll ), 
-                              throttled ) )
+                              ( float(processed) / duration_since_last_poll ) ) )
                     else:
                         # Initialize our thread stats dictionary
                         self.thread_stats[thread_name] = {}
@@ -449,42 +518,36 @@ class MasterControlProgram:
                         data = cache_lookup[cache_name]
                     else:
                         # Get the value from Alice
-                        data = self.alice.get_queue_depth(info['connection'], info['queue'])
+                        data = self.alice.get_queue_depth(info['connection'], info['monitor_port'], info['queue'])
                         cache_lookup[cache_name] = data
 
                     # Easier to work with variables
                     queue_depth = int(data['depth'])
-                    min = self.config['Bindings'][info['binding']]['consumers']['min']
-                    max = self.config['Bindings'][info['binding']]['consumers']['max']
+                    min_threads = self.config['Bindings'][info['binding']]['consumers']['min']
+                    max_threads = self.config['Bindings'][info['binding']]['consumers']['max']
                     threshold = self.config['Bindings'][info['binding']]['consumers']['threshold']
 
+
                     # If our queue depth exceeds the threshold and we haven't maxed out make a new worker
-                    if queue_depth > threshold and len(binding['threads']) < max:
+                    if queue_depth > threshold and len(binding['threads']) < max_threads:
                 
-                        logging.info( 'Spawning worker thread for connection "%s" binding "%s" routing_key "%s": %i messages pending, %i threshhold, %i min, %i max, %i consumers active.' % 
+                        logging.info( 'MCP: Spawning worker thread for connection "%s" binding "%s" routing_key "%s": %i messages pending, %i threshold, %i min, %i max, %i consumers active.' % 
                                         ( info['connection'], 
                                           info['binding'], 
                                           info['routing_key'], 
                                           queue_depth, 
                                           threshold,
-                                          min,
-                                          max,
+                                          min_threads,
+                                          max_threads,
                                           len(binding['threads']) ) )
-
-                        # Create a unique thread name
-                        new_thread_name = '%s_%s_%s_%i' % ( info['connection'], 
-                                                     info['binding'], 
-                                                     info['routing_key'], 
-                                                     len(binding['threads']))
 
                         # Create the new thread making it use self.consume
                         new_thread = ConsumerThread( self.config,
-                                                     new_thread_name, 
                                                      info['binding'], 
                                                      info['connection'] )
 
                         # Add to our dictionary of active threads
-                        binding['threads'][new_thread_name] = new_thread
+                        binding['threads'].append(new_thread)
 
                         # Start the thread
                         new_thread.start()
@@ -493,37 +556,45 @@ class MasterControlProgram:
                         break
 
                 # Check if our queue depth is below our threshold and we have more than the min amount
-                if queue_depth < threshold and len(binding['threads']) > min:
+                if queue_depth < threshold and len(binding['threads']) > min_threads:
+
+                    logging.info( 'MCP: Removing worker thread for connection "%s" binding "%s": %i messages pending, %i threshold, %i min, %i max, %i threads active.' % 
+                                    ( info['connection'], 
+                                      info['binding'], 
+                                      queue_depth, 
+                                      threshold,
+                                      min_threads,
+                                      max_threads,
+                                      len(binding['threads']) ) )
 
                     # Remove a thread
-                    for thread_name, thread in binding['threads'].items():
-                        if not thread.is_locked():
-                            logging.info( 'Removed worker thread for connection "%s" binding "%s" routing_key "%s": %i messages pending, %i threshhold, %i min, %i max, %i consumers active.' % 
-                                            ( info['connection'], 
-                                              info['binding'], 
-                                              info['routing_key'], 
-                                              queue_depth, 
-                                              threshold,
-                                              min,
-                                              max,
-                                              len(binding['threads']) ) )
+                    thread =  binding['threads'].pop() 
+            
+                    while thread.is_locked():
+                        logging.debug( 'MCP: Waiting on %s to unlock so we can shut it down' % thread.getName() )
+                        time.sleep(1)
                     
-                            # Shutdown the thread gracefully          
-                            thread.shutdown()
-                    
-                            # Remove it from the start
-                            del binding['threads'][thread_name]
-                    
-                            # We only want to remove one thread per poll
-                            break;
+                    # Shutdown the thread gracefully          
+                    thread.shutdown()
+            
+                    # We only want to remove one thread per poll
+                    break;
         
-                logging.info('MCP Poll Results for binding #%i: %i total messages processed in %f seconds (%f mps). %i threads throttled themselves %i times.' %
+                logging.info('MCP: Binding #%i processed %i total messages in %.2f seconds at a rate of %.2f mps.' %
                                ( offset, 
                                  total_processed, 
                                  duration_since_last_poll, 
-                                 ( float(total_processed) / duration_since_last_poll ),
-                                 len(binding['threads']), 
-                                 total_throttled ) )
+                                 ( float(total_processed) / duration_since_last_poll ) ) )
+                                 
+                if len(binding['threads']) > 1:
+                    logging.info('MCP: Binding #%i has %i threads which throttled themselves %i times.' % 
+                              ( offset,
+                                len(binding['threads']), 
+                                total_throttled ) )
+                else:
+                    logging.info('MCP: Binding #%i has 1 thread which throttled itself %i times.' % 
+                              ( offset, total_throttled ) )
+
                 offset += 1
             
             # Get our last poll time
@@ -532,7 +603,7 @@ class MasterControlProgram:
     def shutdown(self):
         """ Graceful shutdown of the MCP means shutting down threads too """
         
-        logging.debug( 'Master Control Program Shutting Down' )
+        logging.debug( 'MCP: Master Control Program Shutting Down' )
         
         # Get the thread count
         threads = self.threadCount()
@@ -547,26 +618,25 @@ class MasterControlProgram:
             for binding in self.bindings:
                 
                 # Loop through all the threads in this binding
-                for thread_name, thread in binding['threads'].items():
+                for x in xrange(0, len(binding['threads'])):
 
                     # Let the thread know we want to shutdown
-                    thread.shutdown()
-
-                    # If the thread is not locked, shut down the thread
-                    if not thread.is_locked():
-                        del binding['threads'][thread_name]
+                    thread = binding['threads'].pop()
+                    while not thread.shutdown():
+                        logging.debug('MCP: Waiting on %s to shutdown properly' % thread.getName())
+                        time.sleep(1)
 
             # Get our updated thread count and only sleep then loop if it's > 0, 
             threads = self.threadCount()
             
             # If we have any threads left, sleep for a second before trying again
             if threads:
-                logging.debug( 'Waiting on %i threads to cleanly shutdown.' % threads )
+                logging.debug( 'MCP: Waiting on %i threads to cleanly shutdown.' % threads )
                 time.sleep(1)
                     
     def start(self):
         """ Initialize all of the consumer threads when the MCP comes to life """
-        logging.debug( 'Master Control Program Starting Up' )
+        logging.debug( 'MCP: Master Control Program Starting Up' )
 
         # Loop through all of the bindings
         for binding_name in self.config['Bindings']:
@@ -574,19 +644,15 @@ class MasterControlProgram:
             # Create the dictionary values for this binding
             binding = { 'name': binding_name }
             binding['queue'] = self.config['Bindings'][binding_name]['queue']
-            binding['threads'] = {}
+            binding['threads'] = []
 
             # For each connection, kick off the min consumers and start consuming
             for connect_name in self.config['Bindings'][binding_name]['connections']:
                 for i in xrange( 0, self.config['Bindings'][binding_name]['consumers']['min'] ):
-                    logging.debug( 'Creating worker thread #%i for connection "%s" binding "%s"' % ( i, connect_name, binding_name ) )
-                    routing_key = self.config['Bindings'][binding_name]['routing_key']
-                    # Create a unique thread name
-                    thread_name = '%s_%s_%s_%i' % ( connect_name, binding_name, routing_key, i )
+                    logging.debug( 'MCP: Creating worker thread #%i for connection "%s" binding "%s"' % ( i, connect_name, binding_name ) )
 
                     # Create the new thread making it use self.consume
                     thread = ConsumerThread( self.config,
-                                             thread_name, 
                                              binding_name, 
                                              connect_name );
 
@@ -597,7 +663,7 @@ class MasterControlProgram:
                     if thread.isAlive():
 
                         # Add to our dictionary of active threads
-                        binding['threads'][thread_name] = thread
+                        binding['threads'].append(thread)
 
             # Append this binding to our binding stack
             self.bindings.append(binding)
@@ -612,19 +678,19 @@ class MasterControlProgram:
 
 def shutdown(signum = 0, frame = None):
     """ Application Wide Graceful Shutdown """
-    global mcp
+    global mcp, process
     
-    logging.info( 'Graceful shutdown initiated.' )
+    logging.info( 'Graceful shutdown of rejected.py running "%s" initiated.' % process )
     mcp.shutdown()
-    logging.debug( 'Graceful shutdown complete' )
+    logging.debug( 'Graceful shutdown of rejected.py running "%s" complete' % process )
     os._exit(signum)
 
 def main():
     """ Main Application Handler """
-    global mcp, mcp_poll_delay
+    global mcp, mcp_poll_delay, process
     
     usage = "usage: %prog [options]"
-    version_string = "%%prog %s" % version
+    version_string = "%%prog %s" % __version__
     description = "rejected.py consumer daemon"
     
     # Create our parser and setup our command line options
@@ -674,7 +740,13 @@ def main():
     
     # Parse our options and arguments                                                                        
     options, args = parser.parse_args()
-     
+    
+    # Get the config file only for logging options
+    parts = options.config.split('/')
+    process = parts[len(parts) - 1]
+    parts = process.split('.')
+    process = parts[0]
+    
     # Load the Configuration file
     try:
             stream = file(options.config, 'r')
@@ -712,14 +784,29 @@ def main():
     else:
         # Build a specific path to our log file
         if config['Logging'].has_key('filename'):
-            config['Logging']['filename'] = os.path.join(
-                config['Location']['base'], 
-                config['Location']['logs'], 
-                config['Logging']['filename'] )
+            config['Logging']['filename'] = os.path.join( os.path.dirname(__file__), 
+                                                          config['Logging']['directory'], 
+                                                          config['Logging']['filename'] )
         
     # Pass in our logging config 
     logging.basicConfig(**config['Logging'])
     logging.info('Log level set to %s' % logging_level)
+
+    # If we have supported handler
+    if config['Logging'].has_key('handler'):
+        
+        # If we want to syslog
+        if config['Logging']['handler'] == 'syslog':
+
+            from logging.handlers import SysLogHandler
+
+            # Create the syslog handler            
+            logging_handler = SysLogHandler( address='/dev/log', facility = SysLogHandler.LOG_LOCAL6 )
+            
+            # Add the handler
+            logger = logging.getLogger()
+            logger.addHandler(logging_handler)
+            logger.debug('Sending message')
 
     # Make sure if we specified single thread that we specified connection and binding
     if options.single_thread == True:
@@ -759,7 +846,7 @@ def main():
         logging.debug( 'rejected.py has forked into the background.' )
         
         # Detach from parent environment
-        os.chdir(config['Location']['base']) 
+        os.chdir( os.path.dirname(__file__) ) 
         os.setsid()
         os.umask(0) 
 
@@ -767,11 +854,11 @@ def main():
         sys.stdin.close()
         
         # Redirect stdout, stderr
-        sys.stdout = open(os.path.join(config['Location']['base'], 
-            config['Location']['logs'], "stdout.log"), 'w')
-        sys.stderr = open(os.path.join(config['Location']['base'], 
-            config['Location']['logs'], "stderr.log"), 'w')
-
+        sys.stdout = open(os.path.join(os.path.dirname(__file__), 
+                          config['Logging']['directory'], "stdout.log"), 'w')
+        sys.stderr = open(os.path.join(os.path.dirname(__file__), 
+                          config['Logging']['directory'], "stderr.log"), 'w')
+                                                 
     # Set our signal handler so we can gracefully shutdown
     signal.signal(signal.SIGTERM, shutdown)
 
@@ -782,7 +869,14 @@ def main():
     mcp.start()
     
     # Loop until someone wants us to stop
-    do_poll = options.monitor and not options.single_thread
+    do_poll = config['Monitor']['enabled'] and not options.single_thread
+
+    # Override the poll delay if set
+    if do_poll:
+        if config['Monitor'].has_key('interval'):
+            mcp_poll_delay = config['Monitor']['interval']
+            logging.debug('rejected.py: Set mcp_poll_delay to %i seconds.' % mcp_poll_delay)
+
     while 1:
         
         # Have the Master Control Process poll
@@ -790,6 +884,7 @@ def main():
             # Check to see if we need to adjust our threads
             if do_poll:
                 mcp.poll()
+                logging.debug('rejected.py:Thread Count: %i' % threading.active_count())
 
             # Sleep is so much more CPU friendly than pass
             time.sleep(mcp_poll_delay)
