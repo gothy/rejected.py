@@ -2,3 +2,5 @@
 logs/*.txt
 *.pyc
 */*.pyc
+processors/mongo_processor.py
+rejected.yaml

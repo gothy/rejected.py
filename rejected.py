@@ -183,7 +183,7 @@ class ConsumerThread( threading.Thread ):
                # Keep track of how many errors we've had
                self.errors += 1
                
-        except Exception as e:
+        except Exception, e:
             logging.critical('ConsumerThread: Processor threw an uncaught exception')
             logging.critical('ConsumerThread: %s' % str(e))
              
@@ -248,7 +248,7 @@ class ConsumerThread( threading.Thread ):
         """ Meat of the queue consumer code """
 
         logging.debug( '%s: Running thread' % self.getName() )
-        retries = 100
+        retries = 10000
         while self.running:
             try:
                 self.connectAndWait()
@@ -257,7 +257,7 @@ class ConsumerThread( threading.Thread ):
                 retries -= 1
                 if retries < 1:
                     break
-                time.sleep(1)
+                time.sleep(10)
         logging.info( '%s: Exiting ConsumerThread.run()' % self.getName() )
 
     def connectAndWait(self):
